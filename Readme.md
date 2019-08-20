@@ -7,7 +7,10 @@ for Graceful shutdown
 - Lifecycle Hooks (Graceful Shutdown)  
 - CodePipeline for State Machine  
 - Lambda Layers and X-Ray
-- 
+
+# 説明
+![](./images/BlueGreen.gif)  
+![](./images/LifeCycleHook.gif)  
 
 # Related
 
