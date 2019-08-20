@@ -1,0 +1,300 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  This template is a stack to blue-green depoloy independ instances
+
+Parameters:
+  ProjectName:
+    Type: String
+  RoleName:
+    Type: String
+  Environment:
+    Type: String
+  LambdaS3Bucket:
+    Description: >-
+      The name of the S3 bucket that contains the source artifact
+    Type: String
+
+Resources:
+
+  # -----------------------------------------
+  # Step functions & Lambda functions Role
+  # -----------------------------------------
+  LambdaSFNRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-bluegreen-snf-${Environment}-lambda-role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+        - arn:aws:iam::aws:policy/AmazonSSMReadOnlyAccess
+
+  LambdaSFNPolicy:
+    DependsOn:
+      - LambdaSFNRole
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub ${ProjectName}-bluegreen-sfn-${Environment}-lambda-policy
+      Roles:
+        - !Ref LambdaSFNRole
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+              - Action:
+                  - cloudwatch:*
+                  - logs:*
+                  - ses:*
+                  - s3:*
+                  - ec2:*
+                  - autoscaling:*
+                  - iam:PassRole
+                Effect: Allow
+                Resource:
+                  - '*'
+
+  SFNServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-bluegreen-${Environment}-sfn-role
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - !Sub states.${AWS::Region}.amazonaws.com
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSStepFunctionsFullAccess
+      Path: !Join
+        - ''
+        - - /
+          - !Ref AWS::StackName
+          - /
+
+  SFNPolicy:
+    DependsOn:
+      - SFNServiceRole
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub ${ProjectName}-bluegreen-${Environment}-sfn-policy
+      Roles:
+        - !Ref SFNServiceRole
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - lambda:InvokeFunction
+            Effect: Allow
+            Resource:
+              - !GetAtt StateCreateMQGreenLCASG.Arn
+              - !GetAtt StateGetGreenInstances.Arn
+              - !GetAtt StateDeleteBlueASG.Arn
+              - !GetAtt StateGetBlueInstances.Arn
+              - !GetAtt StateStopBlueASG.Arn
+
+  # -----------------------------------------
+  # Lambda Function
+  # -----------------------------------------
+  StateCreateMQGreenLCASG:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: StateCreateMQGreenLCASG
+      Description: Always return success
+      Timeout: 200
+      Handler: StateCreateMQGreenLCASG.lambda_handler
+      Runtime: python3.7
+      Role: !GetAtt LambdaSFNRole.Arn
+      CodeUri: lambda/BlueGreenStateMachine/CreateGreenLCASG/
+      Tracing: Active
+      Layers:
+        - Fn::ImportValue: lambda-layer-common-arn
+#      Layers:
+#      - !Ref LayerCommon
+
+  StateGetGreenInstances:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: StateGetGreenInstances
+      Description: Always return success
+      Timeout: 200
+      Handler: StateGetGreenInstances.lambda_handler
+      Runtime: python3.7
+      Role: !GetAtt LambdaSFNRole.Arn
+      CodeUri: lambda/BlueGreenStateMachine/GetGreenInstances/
+      Tracing: Active
+      Layers:
+        - Fn::ImportValue: lambda-layer-common-arn
+#      Layers:
+#      - !Ref LayerCommon
+
+  StateDeleteBlueASG:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: StateDeleteBlueASG
+      Description: Always return success
+      Timeout: 200
+      Handler: StateDeleteBlueASG.lambda_handler
+      Runtime: python3.7
+      Role: !GetAtt LambdaSFNRole.Arn
+      CodeUri: lambda/BlueGreenStateMachine/DeleteBlueASG/
+      Tracing: Active
+      Layers:
+        - Fn::ImportValue: lambda-layer-common-arn
+#      Layers:
+#      - !Ref LayerCommon
+
+  StateGetBlueInstances:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: StateGetBlueInstances
+      Description: Always return success
+      Timeout: 200
+      Handler: StateGetBlueInstances.lambda_handler
+      Runtime: python3.7
+      Role: !GetAtt LambdaSFNRole.Arn
+      CodeUri: lambda/BlueGreenStateMachine/GetBlueInstances/
+      Tracing: Active
+      Layers:
+        - Fn::ImportValue: lambda-layer-common-arn
+#      Layers:
+#      - !Ref LayerCommon
+
+  StateStopBlueASG:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: StateStopBlueASG
+      Description: Always return success
+      Timeout: 200
+      Handler: StateStopBlueASG.lambda_handler
+      Runtime: python3.7
+      Role: !GetAtt LambdaSFNRole.Arn
+      CodeUri: lambda/BlueGreenStateMachine/StopBlueASG/
+      Tracing: Active
+      Layers:
+        - Fn::ImportValue: lambda-layer-common-arn
+#      Layers:
+#      - !Ref LayerCommon
+
+#  LayerCommon:
+#    Type: AWS::Serverless::LayerVersion
+#    Properties:
+#      LayerName: state-common-layer
+#      Description: Common Application Resource layer
+#      ContentUri: lambda/layer
+
+  # -----------------------------------------
+  # Step functions State Machine
+  # -----------------------------------------
+  SfnBlueGreenStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub ${ProjectName}-${RoleName}-${Environment}-BlueGreen
+      RoleArn: !GetAtt SFNServiceRole.Arn
+      DefinitionString: !Sub |-
+        {
+          "Comment": "Independent EC2 Instances Blue Green deployment",
+          "StartAt": "CreateGreenLCASG",
+          "States": {
+            "CreateGreenLCASG": {
+                "Type": "Task",
+                "Comment": "StateCreateGreenLCASG API",
+                "Resource": "${StateCreateMQGreenLCASG.Arn}",
+                "ResultPath": "$.green",
+                "Next": "StateGetGreenInstances"
+            },
+            "StateGetGreenInstances": {
+                "Type": "Task",
+                "Comment": "StateGetGreenInstances API",
+                "Resource": "${StateGetGreenInstances.Arn}",
+                "ResultPath": "$.green",
+                "Next": "IsGreenInstancesReached"
+            },
+            "IsGreenInstancesReached": {
+                "Type": "Choice",
+                "Choices": [
+                    {
+                        "Variable": "$.green.continue_loop",
+                        "BooleanEquals": true,
+                        "Next": "StateStopBlueASG"
+                    }
+                ],
+                "Default": "Wait"
+            },
+            "Wait": {
+                "Type": "Wait",
+                "SecondsPath": "$.Wait",
+                "Next": "StateGetGreenInstances"
+            },
+            "StateStopBlueASG": {
+                "Type": "Task",
+                "Comment": "StateStopBlueASG API",
+                "Resource": "${StateStopBlueASG.Arn}",
+                "ResultPath": "$.blue",
+                "Next": "StateGetBlueInstances"
+            },
+            "StateGetBlueInstances": {
+                "Type": "Task",
+                "Comment": "StateGetBlueInstances API",
+                "Resource": "${StateGetBlueInstances.Arn}",
+                "ResultPath": "$.blue",
+                "Next": "IsBlueInstancesReached"
+            },
+            "IsBlueInstancesReached": {
+                "Type": "Choice",
+                "Choices": [
+                    {
+                        "Variable": "$.blue.continue_terminate_loop",
+                        "BooleanEquals": true,
+                        "Next": "StateDeleteBlueASG"
+                    }
+                ],
+                "Default": "Wait2"
+            },
+            "Wait2": {
+                "Type": "Wait",
+                "SecondsPath": "$.Wait",
+                "Next": "StateGetBlueInstances"
+            },
+            "StateDeleteBlueASG": {
+                "Type": "Task",
+                "Comment": "StateDeleteBlueASG API",
+                "Resource": "${StateDeleteBlueASG.Arn}",
+                "ResultPath": "$.blue_delete_asg_result",
+                "Next": "Final States"
+            },
+            "Final States": {
+              "Type": "Pass",
+              "End": true
+            }
+          }
+        }
+
+
+  # -----------------------------------------
+  # SSM Parameter
+  # -----------------------------------------
+  BasicParameter1:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub ${ProjectName}-GreenGoldenAMIID
+      Type: String
+      Value: ami-0ee3055d91280485d
+      Description: Source AMIID
+
+
+Outputs:
+  SfnBlueGreenStateMachine:
+    Description: SfnBlueGreenStateMachine ARN
+    Value: !Ref SfnBlueGreenStateMachine
+    Export:
+      Name: !Sub ${ProjectName}-${RoleName}-bluegreen-sfn-arn

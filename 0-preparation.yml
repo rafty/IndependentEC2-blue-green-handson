@@ -1,0 +1,24 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  sample vpc
+Parameters:
+  S3BucketPrefix:
+    Description: bucket for blue green deployment lambda functions
+    Type: String
+
+Resources:
+  # -----------------------------------------
+  # S3 Bucket for Build Image
+  # -----------------------------------------
+  BuildImageS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${S3BucketPrefix}-lambda-for-buluegreen-${AWS::Region}
+
+Outputs:
+  BuildImageS3Bucket:
+    Description: BuildImageS3Bucket
+    Value: !Ref BuildImageS3Bucket
+    Export:
+      Name: !Sub ${S3BucketPrefix}-lambda-for-buluegreen-${AWS::Region}

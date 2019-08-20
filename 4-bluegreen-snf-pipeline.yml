@@ -1,0 +1,222 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  This template is a stack to create GoldenAMI by SSM-Automation.
+
+Parameters:
+  ProjectName:
+    Type: String
+  RoleName:
+    Type: String
+  Environment:
+    Type: String
+#  CodeCommitRepo:
+#    Default: ec-mqagt-sfn
+#    Description: Code commit repo name
+#    Type: String
+  RepositoryBranch:
+    Description: The name of the branch for the CodeCommit repo
+    Type: String
+#    Default: master
+    AllowedPattern: '[\x20-\x7E]*'
+    ConstraintDescription: Can contain only ASCII characters.
+  StateMachineInputParamsFile:
+    Type: String
+    Default: state_machine_input.json
+    Description: State machine input parameters file
+
+Resources:
+
+  PipelineArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Join
+        - ''
+        - - pipeline
+          - '-'
+          - !Ref 'AWS::Region'
+          - '-'
+          - !Ref 'AWS::AccountId'
+
+  StateMachineBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Join
+        - ''
+        - - sfn
+          - '-'
+          - !Ref 'AWS::Region'
+          - '-'
+          - !Ref 'AWS::AccountId'
+
+  # -----------------------------------------
+  # CodePipeline
+  # -----------------------------------------
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: lambda
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:*
+                Resource: !GetAtt StateMachineTriggerLambda.Arn
+              - Effect: Allow
+                Action:
+                  - lambda:List*
+                Resource: '*'
+        - PolicyName: s3
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                Resource: !Sub arn:aws:s3:::${PipelineArtifactBucket}/*
+        - PolicyName: codecommit
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - codecommit:*
+                Resource:
+                  Fn::ImportValue: !Sub ${ProjectName}-${RoleName}-bluegreen-sfn-pipeline-repo-arn
+
+
+  # -----------------------------------------
+  # Lambda Role invokes StateMachine
+  # -----------------------------------------
+  StateMachineTriggerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess
+      Policies:
+        - PolicyName: lambdaexecute
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:*
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GPutbject
+                Resource: arn:aws:s3:::*
+        - PolicyName: stepfunctions
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:*
+                Resource: '*'
+                  # Fn::ImportValue:
+                  #   !Sub "${StateMachineStackName}-CodePipelineStepFunctionsStateMachineArn"
+        - PolicyName: codepipeline
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codepipeline:PutJobSuccessResult
+                  - codepipeline:PutJobFailureResul
+                Resource: '*'
+
+  # -----------------------------------------
+  # Lambda invokes StateMachine
+  # -----------------------------------------
+
+  StateMachineTriggerLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: StateMachineTriggerLambda
+      Description: Always return success
+      Timeout: 200
+      Handler: StateMachineTriggerLambda.lambda_handler
+      Runtime: python3.7
+      MemorySize: 128
+      Role: !GetAtt StateMachineTriggerLambdaRole.Arn
+      CodeUri: pipeline/lambda/
+      Environment:
+        Variables:
+          stateMachineArn:
+            Fn::ImportValue: !Sub ${ProjectName}-${RoleName}-bluegreen-sfn-arn
+      Tracing: Active
+      Layers:
+        - Fn::ImportValue: lambda-layer-common-arn
+
+  # -----------------------------------------
+  # CodePipeline
+  # -----------------------------------------
+  BlueGreenSFNCodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    DependsOn:
+      - PipelineArtifactBucket
+    Properties:
+      Name: !Sub ${ProjectName}-${RoleName}-bluegreen-sfn-app
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      ArtifactStore:
+        Location: !Ref PipelineArtifactBucket
+        Type: S3
+      Stages:
+        - Name: Source
+          Actions:
+            - InputArtifacts: []
+              Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Version: 1
+                Provider: CodeCommit
+              OutputArtifacts:
+                - Name: SourceOutput
+              Configuration:
+                BranchName: !Ref RepositoryBranch
+                RepositoryName:
+                  Fn::ImportValue: !Sub ${ProjectName}-${RoleName}-bluegreen-sfn-pipeline-repo-name
+              RunOrder: 1
+        - Name: Deploy
+          Actions:
+            - Name: BlueGreenDeploy
+              InputArtifacts:
+                - Name: SourceOutput
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Version: 1
+                Provider: Lambda
+              Configuration:
+                FunctionName: !Ref StateMachineTriggerLambda
+                UserParameters: !Sub |-
+                  {
+                    "s3Bucket": "${StateMachineBucket}",
+                    "stateMachineFile": "${StateMachineInputParamsFile}"
+                  }
+              RunOrder: 2

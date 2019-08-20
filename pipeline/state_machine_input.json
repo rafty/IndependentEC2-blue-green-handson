@@ -1,0 +1,7 @@
+{
+    "project": "ec",
+    "blue": {
+      "asg_name": "ec-mqagt-dev-asg"
+    },
+    "Wait": 30
+}

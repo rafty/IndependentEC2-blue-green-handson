@@ -1,0 +1,200 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: For CodeDeploy blue green deployment resources.
+Parameters:
+  ProjectName:
+    Type: String
+  RoleName:
+    Type: String
+  Environment:
+    Type: String
+  InstanceCount:
+    Description: Number of Amazon EC2 instances (Must be a number between 1 and 3).
+    Type: Number
+    Default: 2
+    ConstraintDescription: Must be a number between 1 and 3.
+    MinValue: 1
+    MaxValue: 3
+  InstanceType:
+    Description: MQAgent EC2 instance type
+    Type: String
+    Default: t2.micro
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+  OperatorEMail:
+    Description: EMail address to notify if there are any scaling operations
+    Type: String
+    AllowedPattern: >-
+      ([a-zA-Z0-9_\-\.]+)@((\[[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.)|(([a-zA-Z0-9\-]+\.)+))([a-zA-Z]{2,4}|[0-9]{1,3})(\]?)
+    ConstraintDescription: must be a valid email address.
+
+Resources:
+  # -----------------------------------------
+  # AutoScaling LaunchConfiguration
+  # -----------------------------------------
+  MQAgentLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Metadata:
+      'AWS::CloudFormation::Init':
+        config: {}
+    Properties:
+      AssociatePublicIpAddress: true
+      LaunchConfigurationName: !Sub ${ProjectName}-${RoleName}-${Environment}-lcfg
+      IamInstanceProfile:
+        Fn::ImportValue: !Sub ${ProjectName}-${RoleName}-${Environment}-profile
+      ImageId: !Ref LatestAmiId
+      InstanceMonitoring: false
+      InstanceType: !Ref InstanceType
+      SecurityGroups:
+        - Fn::ImportValue: !Sub ${ProjectName}-${RoleName}-${Environment}-sg
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum -y update
+          yum -y install ruby
+          yum -y install wget
+          yum -y install aws-cli
+          yum -y install jq
+
+          # SSM Agent
+          echo "Setup SSM Agent"
+          cd /tmp
+          yum -y install https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/linux_amd64/amazon-ssm-agent.rpm
+          start amazon-ssm-agent
+
+          # CloudWatch Logs Agent for CodeDeploy
+          echo "Setup CloudWatch Logs Agent"
+          wget https://s3.amazonaws.com/aws-cloudwatch/downloads/latest/awslogs-agent-setup.py
+          wget https://s3.amazonaws.com/aws-codedeploy-${AWS::Region}/cloudwatch/codedeploy_logs.conf
+          chmod +x ./awslogs-agent-setup.py
+          python awslogs-agent-setup.py -n -r ${AWS::Region} -c s3://aws-codedeploy-${AWS::Region}/cloudwatch/awslogs.conf
+          mkdir -p /var/awslogs/etc/config
+          cp codedeploy_logs.conf /var/awslogs/etc/config/
+          service awslogs restart
+
+          # CodeDeploy Agent
+          echo "Setup CodeDeploy Agent"
+          cd /home/ec2-user
+          wget https://aws-codedeploy-${AWS::Region}.s3.amazonaws.com/latest/install
+          chmod +x ./install
+          ./install auto
+          service codedeploy-agent restart
+
+          # httpd install
+          yum -y install httpd
+          service httpd start
+          #chkconfig httpd on
+
+          # MQAgent LaunchConfig CloudFormation
+          echo "Setup MQAgent LaunchConfig CloudFormation"
+          yum -y install aws-cfn-bootstrap
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource MQAgentLaunchConfig --region ${AWS::Region}
+
+          # Signal the status from cfn-init"
+          /opt/aws/bin/cfn-signal -e $?  --stack ${AWS::StackName} --resource MQAgentASG --region ${AWS::Region}
+  # -----------------------------------------
+  # AutoScalingGroup
+  # -----------------------------------------
+  MQAgentASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub ${ProjectName}-${RoleName}-${Environment}-asg
+      LaunchConfigurationName: !Ref MQAgentLaunchConfig
+      MinSize: !Ref InstanceCount
+      MaxSize: !Ref InstanceCount
+      DesiredCapacity: !Ref InstanceCount
+      NotificationConfigurations:
+        - NotificationTypes:
+            - autoscaling:EC2_INSTANCE_LAUNCH
+            - autoscaling:EC2_INSTANCE_LAUNCH_ERROR
+            - autoscaling:EC2_INSTANCE_TERMINATE
+            - autoscaling:EC2_INSTANCE_TERMINATE_ERROR
+            - autoscaling:TEST_NOTIFICATION
+          TopicARN: !Ref MQAgtAsgNotificationTopic
+      VPCZoneIdentifier:
+        - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-public-sbn1
+        - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-public-sbn2
+      Tags:
+        - Key: ProjectName
+          Value: !Sub ${ProjectName}
+          PropagateAtLaunch: true
+        - Key: RoleName
+          Value: !Sub ${RoleName}
+          PropagateAtLaunch: true
+        - Key: Environment
+          Value: !Sub ${Environment}
+          PropagateAtLaunch: true
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+        Count: 1
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT15M
+        WaitOnResourceSignals: true
+  MQAgentScaleUpPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref MQAgentASG
+      Cooldown: 60
+      ScalingAdjustment: 1
+  MQAgentScaleDownPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref MQAgentASG
+      Cooldown: 60
+      ScalingAdjustment: -1
+  # -----------------------------------------
+  # CloudWatch Alarm
+  # -----------------------------------------
+  CPUAlarmHigh:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Scale-up if CPU > 90% for 10 minutes
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 90
+      AlarmActions:
+        - !Ref MQAgentScaleUpPolicy
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref MQAgentASG
+      ComparisonOperator: GreaterThanThreshold
+  CPUAlarmLow:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Scale-down if CPU < 70% for 10 minutes
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 70
+      AlarmActions:
+        - !Ref MQAgentScaleDownPolicy
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref MQAgentASG
+      ComparisonOperator: LessThanThreshold
+
+  MQAgtAsgNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Sub ${ProjectName}-${RoleName}-${Environment}-asg-topic
+      TopicName: !Sub ${ProjectName}-${RoleName}-${Environment}-asg-topic
+      Subscription:
+        - Endpoint: !Ref OperatorEMail
+          Protocol: email
+Outputs:
+  MQAgentASG:
+    Description: Auto Scaling Group for Webserver
+    Value: !Ref MQAgentASG
+    Export:
+      Name: !Sub ${ProjectName}-${RoleName}-${Environment}-asg

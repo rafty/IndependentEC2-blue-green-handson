@@ -1,0 +1,164 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  AutoScaling Lifecycle Hooks
+Parameters:
+  ProjectName:
+    Type: String
+  RoleName:
+    Type: String
+  Environment:
+    Type: String
+  OperatorEMail:
+    Description: EMail address to notify if there are any scaling operations
+    Type: String
+    AllowedPattern: >-
+      ([a-zA-Z0-9_\-\.]+)@((\[[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.)|(([a-zA-Z0-9\-]+\.)+))([a-zA-Z]{2,4}|[0-9]{1,3})(\]?)
+    ConstraintDescription: must be a valid email address.
+
+Resources:
+  # -----------------------------------------
+  # For ASG Lifecycle Hook
+  # -----------------------------------------
+  LifecycleTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Sub ${ProjectName}-${RoleName}-${Environment}-lifecycle-topic
+      TopicName: !Sub ${ProjectName}-${RoleName}-${Environment}-lifecycle-topic
+
+
+  LifecycleSubsctiption:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !Ref OperatorEMail
+      Protocol: email
+      TopicArn: !Ref LifecycleTopic
+
+
+  LifecycleLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-bluegreen-snf-${Environment}-lambda-lifecycle-role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMFullAccess
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess
+
+
+  LifecyclePolicy:
+    DependsOn:
+      - LifecycleLambdaRole
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub ${ProjectName}-bluegreen-sfn-${Environment}-lambda-lifecycle-policy
+      Roles:
+        - !Ref LifecycleLambdaRole
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - autoscaling:CompleteLifecycleAction
+              - sns:Publish
+            Resource: '*'
+
+  LifecycleHook:
+    Type: AWS::AutoScaling::LifecycleHook
+    Properties:
+      LifecycleHookName: !Sub ${ProjectName}-${RoleName}-${Environment}-lifecyclehook
+      AutoScalingGroupName:
+        Fn::ImportValue: !Sub ${ProjectName}-${RoleName}-${Environment}-asg
+      LifecycleTransition: autoscaling:EC2_INSTANCE_TERMINATING
+
+  LifecycleDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Tags:
+        - Key: ProjectName
+          Value: !Sub ${ProjectName}
+        - Key: RoleName
+          Value: !Sub ${RoleName}
+        - Key: Environment
+          Value: !Sub ${Environment}
+      Content: !Sub |
+        {
+          "schemaVersion": "1.2",
+          "description": "Wait for MQ Agent to be stopped",
+          "parameters": {
+            "AutoscalingGroupName": {
+              "type": "String",
+              "description": "Autoscaling Group Name"
+            }
+          },
+          "runtimeConfig": {
+            "aws:runShellScript": {
+              "properties": [
+                {
+                  "id": "0.aws:runShellScript",
+                  "runCommand": [
+                    "",
+                    "LIFECYCLEHOOKNAME='${LifecycleHook}'",
+                    "SNSTARGET='${LifecycleTopic}'",
+                    "INSTANCEID=$(curl http://169.254.169.254/latest/meta-data/instance-id)",
+                    "REGION=$(curl http://169.254.169.254/latest/meta-data/placement/availability-zone)",
+                    "REGION=${!REGION::-1}",
+                    "HOOKRESULT='CONTINUE'",
+                    "MESSAGE='MQ Agent stopped'",
+                    "",
+                    "sleep 10m",
+                    "",
+                    "aws sns publish --subject 'MQ Agent stopped' --message \"$MESSAGE\"  --target-arn ${!SNSTARGET} --region ${!REGION}",
+                    "aws autoscaling complete-lifecycle-action --lifecycle-hook-name ${!LIFECYCLEHOOKNAME} --auto-scaling-group-name {{ AutoscalingGroupName }} --lifecycle-action-result ${!HOOKRESULT} --instance-id ${!INSTANCEID}  --region ${!REGION}"
+                  ]
+                }
+              ]
+            }
+          }
+        }
+
+
+  MQAgentLifecycleHookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-${RoleName}-${Environment}-LifecycleHook
+      Description: Always return success
+      Timeout: 200
+      Handler: MQAgentLifecycleHook.lambda_handler
+      Runtime: python3.7
+      Role: !GetAtt LifecycleLambdaRole.Arn
+      CodeUri: lifecyclehooks/MQAgentLifecycleHook/
+      Environment:
+        Variables:
+          DOCUMENT_NAME: !Ref LifecycleDocument
+      Tracing: Active
+      Layers:
+        - Fn::ImportValue: lambda-layer-common-arn
+
+  Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt MQAgentLifecycleHookFunction.Arn
+      Principal: events.amazonaws.com
+
+  EventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern: !Sub |
+        {
+          "source": [ "aws.autoscaling" ],
+          "detail": {
+            "LifecycleTransition": ["autoscaling:EC2_INSTANCE_TERMINATING"]
+          }
+        }
+      Targets:
+      - Arn: !GetAtt MQAgentLifecycleHookFunction.Arn
+        Id: target

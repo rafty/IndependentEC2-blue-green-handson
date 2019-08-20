@@ -1,0 +1,74 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  ecdevops vpc
+Parameters:
+  ProjectName:
+    Type: String
+    # Default: ectest
+  RoleName:
+    Type: String
+    # Default: mqagt
+  Environment:
+    Type: String
+    # Default: dev
+
+Resources:
+  # -----------------------------------------
+  # Web Server Instance用 Role
+  # -----------------------------------------
+  MQAgentServerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${RoleName}-${Environment}-role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+        - arn:aws:iam::aws:policy/CloudWatchFullAccess
+        - arn:aws:iam::aws:policy/AmazonSSMFullAccess
+
+  MQAgentServerPolicies:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub ${ProjectName}-${RoleName}-${Environment}-policy
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'ec2:*'
+              - 'codedeploy:*'
+              - 'autoscaling:Describe*'
+              - 'cloudformation:Describe*'
+              - 'cloudformation:GetTemplate'
+              - 's3:Get*'
+              - 's3:List*'
+              - 'autoscaling:CompleteLifecycleAction'
+              - 'sns:*'
+            Resource: '*'
+      Roles:
+        - !Ref MQAgentServerRole
+
+  MQAgentServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub ${ProjectName}-${RoleName}-${Environment}-profile
+      Path: /
+      Roles:
+        - !Ref MQAgentServerRole
+
+Outputs:
+
+  MQAgentServerInstanceProfile:
+    Description: Instance Profile for MQ Agent Server
+    Value: !Ref MQAgentServerInstanceProfile
+    Export:
+      Name: !Sub ${ProjectName}-${RoleName}-${Environment}-profile

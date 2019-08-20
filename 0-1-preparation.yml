@@ -1,0 +1,19 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  lambda Layers
+
+Resources:
+  LambdaLayerCommon:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: state-common-layer
+      Description: Common Application Resource layer
+      ContentUri: lambda/layer
+
+Outputs:
+  LambdaLayerCommonARN:
+    Description: LambdaLayerCommonARN
+    Value: !Ref LambdaLayerCommon
+    Export:
+      Name: lambda-layer-common-arn
