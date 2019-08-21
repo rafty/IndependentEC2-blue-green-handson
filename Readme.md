@@ -196,3 +196,17 @@ $ aws cloudformation deploy \
 ```
 
 
+# StepFunctionsの実行
+
+$ STATE_MACHINE_ARN=arn:aws:states:ap-northeast-1:338456725408:stateMachine:ec-mqagt-dev-BlueGreen
+
+$ aws stepfunctions start-execution \
+--state-machine-arn $STATE_MACHINE_ARN \
+--input '{
+    "project": "ec",    
+    "blue": {
+      "asg_name": "ec-mqagt-dev-asg"
+    },
+    "Wait": 30
+}'
+
